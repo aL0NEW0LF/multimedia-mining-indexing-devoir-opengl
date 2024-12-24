@@ -30,9 +30,16 @@ glShadeModel(GL_SMOOTH)  # most obj files expect to be smooth-shaded
 # LOAD OBJECT AFTER PYGAME INIT
 # obj = OBJ(sys.argv[1], swapyz=True)
 
-obj = load_simplified_obj(
-    sys.argv[1], voxel_size=float(sys.argv[2]), swapyz=True, contraction=sys.argv[3]
-)
+method = sys.argv[1]
+
+if method == "vertex_clustering":
+    obj = load_simplified_obj(
+        sys.argv[2], voxel_size=float(sys.argv[3]), swapyz=True, contraction=sys.argv[4]
+    )
+elif method == "edge_collapse":
+    obj = load_simplified_obj(sys.argv[2], swapyz=True, method=method)
+else:
+    raise ValueError(f"Unknown method: {method}")
 
 clock = pygame.time.Clock()
 

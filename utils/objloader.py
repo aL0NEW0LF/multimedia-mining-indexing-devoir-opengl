@@ -3,8 +3,9 @@ import pygame
 from OpenGL.GL import *
 import numpy as np
 from enum import Enum
-from typing import List, Tuple, Dict, Set
 import os
+from typing import List, Set, Optional, Dict, Tuple
+from collections import defaultdict
 
 
 class SimplificationContraction(Enum):
@@ -47,6 +48,137 @@ class Quadric:
             return None
 
 
+@dataclass(eq=False)
+class CollapseVertex:
+    position: np.ndarray
+    id: int
+    neighbors: Set["CollapseVertex"]
+    faces: Set["CollapseTriangle"]
+    obj_dist: float = float("inf")
+    collapse_to: Optional["CollapseVertex"] = None
+
+    def __hash__(self):
+        return hash(self.id)
+
+    def __eq__(self, other):
+        if isinstance(other, CollapseVertex):
+            return self.id == other.id
+        return False
+
+    def remove_if_non_neighbor(self, n: "CollapseVertex"):
+        if n not in self.neighbors:
+            return
+        for face in self.faces:
+            if face.has_vertex(n):
+                return
+        self.neighbors.remove(n)
+
+
+class CollapseTriangle:
+    def __init__(self, v0: CollapseVertex, v1: CollapseVertex, v2: CollapseVertex):
+        self.vertices = [v0, v1, v2]
+        self.normal = self.compute_normal()
+
+        for i in range(3):
+            self.vertices[i].faces.add(self)
+            for j in range(3):
+                if i != j:
+                    self.vertices[i].neighbors.add(self.vertices[j])
+
+    def compute_normal(self) -> np.ndarray:
+        v0, v1, v2 = [v.position for v in self.vertices]
+        normal = np.cross(v1 - v0, v2 - v1)
+        norm = np.linalg.norm(normal)
+        return normal / norm if norm > 0 else np.zeros(3)
+
+    def has_vertex(self, v: CollapseVertex) -> bool:
+        return any(v.id == vertex.id for vertex in self.vertices)
+
+    def replace_vertex(self, vold: CollapseVertex, vnew: CollapseVertex):
+        assert vold in self.vertices and vnew not in self.vertices
+        idx = self.vertices.index(vold)
+        self.vertices[idx] = vnew
+
+        vold.faces.remove(self)
+        vnew.faces.add(self)
+
+        for v in self.vertices:
+            vold.remove_if_non_neighbor(v)
+            v.remove_if_non_neighbor(vold)
+
+        for i in range(3):
+            for j in range(3):
+                if i != j:
+
+                    self.vertices[i].neighbors.add(self.vertices[j])
+
+        self.normal = self.compute_normal()
+
+
+def compute_edge_collapse_cost(u: CollapseVertex, v: CollapseVertex) -> float:
+    edge_length = np.linalg.norm(v.position - u.position)
+    curvature = 0.0
+
+    sides = [face for face in u.faces if face.has_vertex(v)]
+
+    for face in u.faces:
+        min_curv = 1.0
+        for side in sides:
+            dot_prod = np.dot(face.normal, side.normal)
+            min_curv = min(min_curv, (1.0 - dot_prod) / 2.0)
+        curvature = max(curvature, min_curv)
+
+    return edge_length * curvature
+
+
+def compute_vertex_collapse_cost(v: CollapseVertex):
+    if not v.neighbors:
+        v.collapse_to = None
+        v.obj_dist = -0.01
+        return
+
+    v.obj_dist = float("inf")
+    v.collapse_to = None
+
+    for neighbor in v.neighbors:
+        dist = compute_edge_collapse_cost(v, neighbor)
+        if dist < v.obj_dist:
+            v.collapse_to = neighbor
+            v.obj_dist = dist
+
+
+def find_minimum_cost_edge(vertices: List[CollapseVertex]) -> Optional[CollapseVertex]:
+    if not vertices:
+        return None
+    return min(vertices, key=lambda v: v.obj_dist)
+
+
+def collapse_edge(
+    u: CollapseVertex, vertices: List[CollapseVertex], triangles: List[CollapseTriangle]
+):
+    if not u.collapse_to:
+
+        vertices.remove(u)
+        return
+
+    v = u.collapse_to
+    neighbors = list(u.neighbors)
+
+    faces_to_remove = [face for face in u.faces if face.has_vertex(v)]
+    for face in faces_to_remove:
+        if face in triangles:
+            triangles.remove(face)
+
+    remaining_faces = [face for face in u.faces if face not in faces_to_remove]
+    for face in remaining_faces:
+        face.replace_vertex(u, v)
+
+    vertices.remove(u)
+
+    for neighbor in neighbors:
+        compute_vertex_collapse_cost(neighbor)
+
+
 def MTL(filename):
     contents = {}
     mtl = None
@@ -61,7 +193,6 @@ def MTL(filename):
         elif mtl is None:
             raise ValueError("mtl file doesn't start with newmtl stmt")
         elif values[0] == "map_Kd":
-            # load the texture referred to by this declaration
             mtl[values[0]] = values[1]
             surf = pygame.image.load(mtl["map_Kd"])
             image = pygame.image.tostring(surf, "RGBA", 1)
@@ -211,6 +342,30 @@ class OBJ:
                         norms.append(0)
                 self.faces.append((face, norms, texcoords, material))
 
+    def get_triangle_plane(self, tidx: int) -> np.ndarray:
+        triangle = self.faces[tidx]
+
+        v0 = np.array(self.vertices[triangle[0][0] - 1])
+        v1 = np.array(self.vertices[triangle[0][1] - 1])
+        v2 = np.array(self.vertices[triangle[0][2] - 1])
+
+        normal = np.cross(v1 - v0, v2 - v0)
+        norm = np.linalg.norm(normal)
+        if norm == 0:
+            return np.array([0, 0, 0, 0])
+        normal = normal / norm
+        d = -np.dot(normal, v0)
+        return np.array([*normal, d])
+
+    def get_triangle_area(self, tidx: int) -> float:
+        triangle = self.faces[tidx]
+
+        v0 = np.array(self.vertices[triangle[0][0] - 1])
+        v1 = np.array(self.vertices[triangle[0][1] - 1])
+        v2 = np.array(self.vertices[triangle[0][2] - 1])
+
+        return 0.5 * np.linalg.norm(np.cross(v0 - v1, v0 - v2))
+
     def create_gl_list(self):
         """Creates an OpenGL display list for the object"""
         if self.gl_list != 0:
@@ -247,7 +402,7 @@ class OBJ:
         self,
         voxel_size: float,
         contraction: SimplificationContraction = SimplificationContraction.Average,
-    ):
+    ) -> int:
         """Simplifies the mesh using vertex clustering."""
         if voxel_size <= 0.0:
             raise ValueError("voxel_size must be positive")
@@ -281,6 +436,33 @@ class OBJ:
                 new_pos = np.mean([vertices[i] for i in vert_indices], axis=0)
                 new_vertices[voxel_vert_ind[vox_idx]] = new_pos.tolist()
 
+        elif contraction == SimplificationContraction.Quadric:
+            vert_to_faces: Dict[int, Set[int]] = {}
+            for face_idx, face in enumerate(self.faces):
+                for vidx in face[0]:
+                    if vidx not in vert_to_faces:
+                        vert_to_faces[vidx] = set()
+                    vert_to_faces[vidx].add(face_idx)
+
+            for voxel_idx, vertex_indices in voxel_vertices.items():
+                q = Quadric()
+                for vidx in vertex_indices:
+                    for tidx in vert_to_faces.get(vidx, []):
+                        p = self.get_triangle_plane(tidx)
+                        area = self.get_triangle_area(tidx)
+                        q += Quadric(p, area)
+
+                if q.is_invertible():
+                    v = q.minimum()
+                    if v is not None:
+                        new_pos = v
+                    else:
+                        new_pos = np.mean([vertices[i] for i in vertex_indices], axis=0)
+                else:
+                    new_pos = np.mean([vertices[i] for i in vertex_indices], axis=0)
+
+                new_vertices.append(new_pos.tolist())
+
         new_faces = []
         for face in self.faces:
             old_vertices, normals, texcoords, material = face
@@ -298,21 +480,89 @@ class OBJ:
 
         return len(self.vertices)
 
+    def simplify_edge_collapse(self, target_vertices: int) -> int:
+        """Simplifies the mesh using edge collapse until reaching target vertex count."""
+        if target_vertices >= len(self.vertices):
+            return len(self.vertices)
+
+        collapse_vertices = []
+        vertex_map = {}
+
+        for i, vertex in enumerate(self.vertices):
+            cv = CollapseVertex(
+                position=np.array(vertex), id=i, neighbors=set(), faces=set()
+            )
+            collapse_vertices.append(cv)
+            vertex_map[i] = cv
+
+        collapse_triangles = []
+        for face in self.faces:
+            vertices = face[0]
+            if len(vertices) != 3:
+                continue
+
+            triangle = CollapseTriangle(
+                vertex_map[vertices[0] - 1],
+                vertex_map[vertices[1] - 1],
+                vertex_map[vertices[2] - 1],
+            )
+            collapse_triangles.append(triangle)
+
+        for vertex in collapse_vertices:
+            compute_vertex_collapse_cost(vertex)
+
+        while len(collapse_vertices) > target_vertices:
+            vertex = find_minimum_cost_edge(collapse_vertices)
+            if not vertex:
+                break
+            collapse_edge(vertex, collapse_vertices, collapse_triangles)
+
+        new_vertices = []
+        new_vertex_map = {}
+
+        for i, vertex in enumerate(collapse_vertices):
+            new_vertices.append(vertex.position.tolist())
+            new_vertex_map[vertex.id] = i
+
+        print(f"Collapsed to {len(new_vertices)} vertices")
+
+        new_faces = []
+        for triangle in collapse_triangles:
+            vertices = [new_vertex_map[v.id] + 1 for v in triangle.vertices]
+            new_faces.append((vertices, [], [], None))
+
+        self.vertices = new_vertices
+        self.faces = new_faces
+        self.create_gl_list()
+
+        return len(self.vertices)
+
 
 def load_simplified_obj(
-    filename: str, voxel_size: float, swapyz: bool = False, contraction: str = "average"
+    filename: str,
+    voxel_size: float = 0.0,
+    target_vertices: int = 0,
+    swapyz: bool = False,
+    contraction: str = "average",
+    method: str = "vertex_clustering",
 ) -> OBJ:
     """Helper function to load and simplify an OBJ file in one step."""
     if not os.path.isfile(filename):
         raise FileNotFoundError(f"File not found: {filename}")
 
-    if contraction not in ["average", "quadric"]:
+    if method not in ["vertex_clustering", "edge_collapse"]:
+        raise ValueError(f"Invalid simplification method: {method}")
+
+    if method != "vertex_clustering" and contraction not in ["average", "quadric"]:
         raise ValueError(f"Invalid contraction method: {contraction}")
 
     start_time = pygame.time.get_ticks()
     obj = OBJ(filename, swapyz=swapyz)
     original_vertices = len(obj.vertices)
-    new_vertices = obj.simplify(voxel_size, SimplificationContraction(contraction))
+    if method == "vertex_clustering":
+        new_vertices = obj.simplify(voxel_size, SimplificationContraction(contraction))
+    else:
+        new_vertices = obj.simplify_edge_collapse(target_vertices)
     end_time = pygame.time.get_ticks()
     print(
         f"Simplified mesh from {original_vertices} to {new_vertices} vertices in {end_time - start_time} ms"
